@@ -1,0 +1,236 @@
+name: Security Pipeline - OWASP Juice Shop
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "18"
+  SEVERITY_THRESHOLD: "high"
+
+jobs:
+  # -----------------------------------------
+  # STAGE 1: SAST - Semgrep
+  # -----------------------------------------
+  sast-semgrep:
+    name: "SAST - Semgrep"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep SAST scan
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/javascript
+            p/nodejs
+            p/secrets
+          generateSarif: "1"
+
+      - name: Upload Semgrep SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-sast
+
+      - name: Upload Semgrep report as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep.sarif
+          retention-days: 30
+
+  # -----------------------------------------
+  # STAGE 2: SCA - npm audit
+  # -----------------------------------------
+  sca-npm-audit:
+    name: "SCA - npm audit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run npm audit (JSON output)
+        run: |
+          mkdir -p reports
+          npm audit --json > reports/npm-audit.json || true
+
+      - name: Run npm audit (human-readable output)
+        run: |
+          npm audit --audit-level=${{ env.SEVERITY_THRESHOLD }} 2>&1 | tee reports/npm-audit.txt || true
+
+      - name: Quality Gate - npm audit
+        run: |
+          CRITICAL=$(cat reports/npm-audit.json | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          vuln = d.get('metadata', {}).get('vulnerabilities', {})
+          print(vuln.get('critical', 0) + vuln.get('high', 0))
+          ")
+          echo "=========================================="
+          echo "  npm audit results"
+          echo "=========================================="
+          echo "Critical + High vulnerabilities found: $CRITICAL"
+          echo "=========================================="
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "::error::Quality Gate failed - $CRITICAL critical/high vulnerabilities found in dependencies"
+            exit 1
+          else
+            echo "Quality Gate passed - no critical/high vulnerabilities found"
+          fi
+
+      - name: Upload npm audit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npm-audit-report
+          path: reports/
+          retention-days: 30
+
+  # -----------------------------------------
+  # STAGE 3: IaC - Checkov
+  # -----------------------------------------
+  iac-checkov:
+    name: "IaC - Checkov"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Checkov IaC scan (SARIF output)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,github_actions
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: false
+          skip_check: >-
+            CKV_DOCKER_2,
+            CKV_DOCKER_3
+
+      - name: Upload Checkov SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-iac
+
+      - name: Run Checkov IaC scan (JSON output)
+        uses: bridgecrewio/checkov-action@master
+        if: always()
+        with:
+          directory: .
+          framework: dockerfile,github_actions
+          output_format: json
+          output_file_path: reports/checkov-report.json
+          soft_fail: true
+
+      - name: Upload Checkov reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-report
+          path: |
+            checkov.sarif
+            reports/checkov-report.json
+          retention-days: 30
+
+  # -----------------------------------------
+  # QUALITY GATE - aggregated result
+  # -----------------------------------------
+  quality-gate:
+    name: "Quality Gate"
+    runs-on: ubuntu-latest
+    needs: [sast-semgrep, sca-npm-audit, iac-checkov]
+    if: always()
+
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Check pipeline status
+        run: |
+          echo "=========================================="
+          echo "  SECURITY PIPELINE - SUMMARY"
+          echo "=========================================="
+          echo "SAST (Semgrep)  : ${{ needs.sast-semgrep.result }}"
+          echo "SCA  (npm audit): ${{ needs.sca-npm-audit.result }}"
+          echo "IaC  (Checkov)  : ${{ needs.iac-checkov.result }}"
+          echo "=========================================="
+
+          FAILED=0
+          for result in \
+            "${{ needs.sast-semgrep.result }}" \
+            "${{ needs.sca-npm-audit.result }}" \
+            "${{ needs.iac-checkov.result }}"; do
+            if [ "$result" = "failure" ]; then
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          if [ "$FAILED" -gt "0" ]; then
+            echo "::error::Quality Gate FAILED - $FAILED stage(s) did not pass"
+            exit 1
+          else
+            echo "Quality Gate PASSED - all stages completed successfully"
+          fi
+
+      - name: Post summary comment to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const results = {
+              semgrep:   '${{ needs.sast-semgrep.result }}',
+              npm_audit: '${{ needs.sca-npm-audit.result }}',
+              checkov:   '${{ needs.iac-checkov.result }}'
+            };
+            const status = r => r === 'success' ? 'PASSED' : r === 'skipped' ? 'SKIPPED' : 'FAILED';
+            const body = `
+            ## Security Pipeline - Results
+
+            | Tool       | Category | Status |
+            |------------|----------|--------|
+            | Semgrep    | SAST     | ${status(results.semgrep)} |
+            | npm audit  | SCA      | ${status(results.npm_audit)} |
+            | Checkov    | IaC      | ${status(results.checkov)} |
+
+            Full reports are available in the Security tab under Code scanning alerts.
+            Artifact reports (JSON/SARIF) can be downloaded from the Actions run page.
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
